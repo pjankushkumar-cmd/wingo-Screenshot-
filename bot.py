@@ -1,4 +1,3 @@
-Bilkul bhai. Part 1 — bot.py नीचे है। इसे पूरा copy करके bot.py नाम से save करना।
 import asyncio
 import logging
 import os
