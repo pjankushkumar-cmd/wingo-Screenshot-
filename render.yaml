@@ -1,0 +1,35 @@
+services:
+  - type: worker
+    name: yaarwin-demo-tracker
+    runtime: python
+
+    buildCommand: >
+      pip install -r requirements.txt &&
+      playwright install --with-deps chromium
+
+    startCommand: python bot.py
+
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+
+      - key: ADMIN_CHAT_ID
+        sync: false
+
+      - key: DEMO_PHONE
+        sync: false
+
+      - key: DEMO_PASSWORD
+        sync: false
+
+      - key: SITE_URL
+        value: https://yaarwin.app/#/login
+
+      - key: HEADLESS
+        value: "true"
+
+      - key: WIN_SCREENSHOT_DELAY
+        value: "10"
+
+      - key: POLL_SECONDS
+        value: "1.5"
