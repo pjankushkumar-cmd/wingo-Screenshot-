@@ -1,9 +1,9 @@
 services:
   - type: worker
     name: yaarwin-demo-tracker
-    runtime: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium
-    startCommand: python bot.py
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     envVars:
       - key: BOT_TOKEN
         sync: false

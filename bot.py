@@ -140,6 +140,7 @@ async def login():
 
     browser = await pw.chromium.launch(
         headless=HEADLESS,
+        channel="chromium",
         args=[
             "--no-sandbox",
             "--disable-dev-shm-usage",
