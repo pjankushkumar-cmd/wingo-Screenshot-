@@ -1,148 +1,144 @@
 import asyncio
+import json
 import logging
 import os
 import re
+from pathlib import Path
 
+import aiohttp
 from playwright.async_api import async_playwright
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
 
-# =========================================================
-# CONFIG
-# =========================================================
-
-SITE_URL = os.getenv(
-    "SITE_URL",
-    "https://yaarwin.app/#/login"
-)
+SITE_LOGIN = "https://yaarwin.app/#/login"
+WINGO_URL = "https://yaarwin.app/#/saasLottery/WinGo?gameCode=WinGo_1M&lottery=WinGo"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
-
-# Optional Render environment login
 DEMO_PHONE = os.getenv("DEMO_PHONE", "")
 DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "")
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1.5"))
+SCREENSHOT_DELAY = int(os.getenv("WIN_SCREENSHOT_DELAY", "10"))
 
-POLL_SECONDS = float(
-    os.getenv("POLL_SECONDS", "1.5")
-)
-
-WIN_SCREENSHOT_DELAY = int(
-    os.getenv("WIN_SCREENSHOT_DELAY", "10")
-)
-
-# Runtime login credentials.
-# Telegram /setlogin can update these.
 login_phone = DEMO_PHONE
 login_password = DEMO_PASSWORD
 
-# =========================================================
-# GLOBALS
-# =========================================================
-
 browser = None
+context = None
 page = None
-playwright_instance = None
-
+pw = None
 tracker_task = None
 
 last_result = None
-last_win_signature = None
-
-
-# =========================================================
-# LOGGING
-# =========================================================
+last_period = None
+last_popup_signature = None
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+log = logging.getLogger("demo-tracker")
 
-logger = logging.getLogger("YaarWinDemoTracker")
 
-
-# =========================================================
-# ADMIN CHECK
-# =========================================================
-
-def get_admin_id():
+def admin_ok(chat_id):
     try:
-        return int(ADMIN_CHAT_ID)
+        return int(chat_id) == int(ADMIN_CHAT_ID)
     except Exception:
-        return None
-
-
-def is_admin(update: Update):
-    admin = get_admin_id()
-
-    if not admin:
         return False
 
-    if not update.effective_chat:
-        return False
 
-    return update.effective_chat.id == admin
+async def tg_call(method, data=None):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    timeout = aiohttp.ClientTimeout(total=40)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, data=data or {}) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Telegram API {resp.status}: {text}")
+            return json.loads(text)
 
 
-# =========================================================
-# TELEGRAM MESSAGE
-# =========================================================
+async def tg_send(chat_id, text):
+    await tg_call("sendMessage", {
+        "chat_id": str(chat_id),
+        "text": text
+    })
 
-async def send_admin_text(text):
-    admin = get_admin_id()
 
-    if not admin:
-        logger.warning("ADMIN_CHAT_ID is not configured.")
-        return
-
-    try:
-        application = Application.builder().token(
-            BOT_TOKEN
-        ).build()
-
-        async with application:
-            await application.bot.send_message(
-                chat_id=admin,
-                text=text
-            )
-
-    except Exception as e:
-        logger.error(
-            "Telegram text error: %s",
-            e
+async def tg_photo(chat_id, path, caption):
+    with open(path, "rb") as f:
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        form.add_field("caption", caption)
+        form.add_field(
+            "photo",
+            f,
+            filename=Path(path).name,
+            content_type="image/png"
         )
 
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
 
-# =========================================================
-# LOGIN
-# =========================================================
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=form) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(await resp.text())
+
+
+async def close_browser():
+    global browser, context, page, pw
+
+    try:
+        if context:
+            await context.close()
+    except Exception:
+        pass
+
+    try:
+        if browser:
+            await browser.close()
+    except Exception:
+        pass
+
+    try:
+        if pw:
+            await pw.stop()
+    except Exception:
+        pass
+
+    browser = None
+    context = None
+    page = None
+    pw = None
+
+
+async def find_first(selectors):
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if await loc.count():
+                return loc
+        except Exception:
+            pass
+    return None
+
 
 async def login():
-
-    global browser
-    global page
-    global playwright_instance
-    global login_phone
-    global login_password
+    global browser, context, page, pw
+    global login_phone, login_password
 
     if not login_phone or not login_password:
         raise RuntimeError(
-            "Demo login is not configured. "
-            "Use /setlogin NUMBER PASSWORD first."
+            "Demo login missing. Use /setlogin NUMBER PASSWORD first."
         )
 
-    logger.info("Starting browser...")
+    await close_browser()
 
-    playwright_instance = await async_playwright().start()
+    pw = await async_playwright().start()
 
-    browser = await playwright_instance.chromium.launch(
+    browser = await pw.chromium.launch(
         headless=HEADLESS,
         args=[
             "--no-sandbox",
@@ -151,923 +147,412 @@ async def login():
         ]
     )
 
+    # Mobile layout, as requested.
     context = await browser.new_context(
-        viewport={
-            "width": 430,
-            "height": 900
-        }
+        viewport={"width": 390, "height": 844},
+        device_scale_factor=2,
+        is_mobile=True,
+        has_touch=True
     )
 
     page = await context.new_page()
 
-    logger.info(
-        "Opening site: %s",
-        SITE_URL
+    log.info("Opening login page")
+    await page.goto(
+        SITE_LOGIN,
+        wait_until="domcontentloaded",
+        timeout=60000
     )
+    await page.wait_for_timeout(2500)
+
+    phone = await find_first([
+        'input[type="tel"]',
+        'input[placeholder*="phone" i]',
+        'input[placeholder*="mobile" i]',
+        'input[placeholder*="number" i]',
+        'input[name*="phone" i]',
+        'input[name*="mobile" i]',
+        'input[name*="username" i]',
+    ])
+
+    password = await find_first([
+        'input[type="password"]',
+        'input[placeholder*="password" i]',
+        'input[name*="password" i]',
+    ])
+
+    if not phone or not password:
+        await page.screenshot(
+            path="login_debug.png",
+            full_page=True
+        )
+        raise RuntimeError(
+            "Login fields were not detected. login_debug.png was saved."
+        )
+
+    await phone.fill(login_phone)
+    await password.fill(login_password)
+
+    button = await find_first([
+        'button[type="submit"]',
+        'input[type="submit"]',
+    ])
+
+    if not button:
+        try:
+            button = page.get_by_role(
+                "button",
+                name=re.compile(r"login|log in|sign in", re.I)
+            ).first
+            if not await button.count():
+                button = None
+        except Exception:
+            button = None
+
+    if not button:
+        await page.screenshot(
+            path="login_button_debug.png",
+            full_page=True
+        )
+        raise RuntimeError(
+            "Login button was not detected. login_button_debug.png was saved."
+        )
+
+    await button.click()
+    await page.wait_for_timeout(5000)
+
+    log.info("Login submitted.")
+
+
+async def open_wingo():
+    if not page:
+        raise RuntimeError("Browser is not running.")
 
     await page.goto(
-        SITE_URL,
+        WINGO_URL,
         wait_until="domcontentloaded",
         timeout=60000
     )
 
     await page.wait_for_timeout(3000)
 
-    # -----------------------------------------------------
-    # PHONE FIELD
-    # -----------------------------------------------------
+    log.info("Opened WinGo 1 Minute page.")
 
-    phone_selectors = [
 
-        'input[type="tel"]',
-
-        'input[placeholder*="phone" i]',
-
-        'input[placeholder*="mobile" i]',
-
-        'input[placeholder*="number" i]',
-
-        'input[name*="phone" i]',
-
-        'input[name*="mobile" i]',
-
-        'input[name*="username" i]',
-
-    ]
-
-    phone = None
-
-    for selector in phone_selectors:
-
-        try:
-
-            locator = page.locator(
-                selector
-            ).first
-
-            if await locator.count():
-
-                phone = locator
-                break
-
-        except Exception:
-            continue
-
-    # -----------------------------------------------------
-    # PASSWORD FIELD
-    # -----------------------------------------------------
-
-    password_selectors = [
-
-        'input[type="password"]',
-
-        'input[placeholder*="password" i]',
-
-        'input[name*="password" i]',
-
-    ]
-
-    password = None
-
-    for selector in password_selectors:
-
-        try:
-
-            locator = page.locator(
-                selector
-            ).first
-
-            if await locator.count():
-
-                password = locator
-                break
-
-        except Exception:
-            continue
-
-    if not phone or not password:
-
-        await page.screenshot(
-            path="login_debug.png",
-            full_page=True
-        )
-
-        raise RuntimeError(
-            "Login fields were not found. "
-            "login_debug.png was created."
-        )
-
-    # -----------------------------------------------------
-    # FILL LOGIN
-    # -----------------------------------------------------
-
-    await phone.fill(
-        login_phone
-    )
-
-    await password.fill(
-        login_password
-    )
-
-    logger.info(
-        "Demo credentials entered."
-    )
-
-    # -----------------------------------------------------
-    # LOGIN BUTTON
-    # -----------------------------------------------------
-
-    login_buttons = [
-
-        page.get_by_role(
-            "button",
-            name=re.compile(
-                r"login|log in|sign in",
-                re.I
-            )
-        ),
-
-        page.locator(
-            'button[type="submit"]'
-        ),
-
-        page.locator(
-            'input[type="submit"]'
-        ),
-
-    ]
-
-    clicked = False
-
-    for locator in login_buttons:
-
-        try:
-
-            if await locator.count():
-
-                await locator.first.click()
-
-                clicked = True
-
-                break
-
-        except Exception:
-            continue
-
-    if not clicked:
-
-        raise RuntimeError(
-            "Login button was not found."
-        )
-
-    await page.wait_for_timeout(
-        5000
-    )
-
-    logger.info(
-        "Login completed."
-    )
-
-
-# =========================================================
-# FIND WINGO
-# =========================================================
-
-async def find_wingo():
-
-    patterns = [
-
-        re.compile(
-            r"win\s*go",
-            re.I
-        ),
-
-        re.compile(
-            r"wingo",
-            re.I
-        ),
-
-    ]
-
-    # Try buttons and links
-    for pattern in patterns:
-
-        for role in [
-            "button",
-            "link"
-        ]:
-
-            try:
-
-                locator = page.get_by_role(
-                    role,
-                    name=pattern
-                ).first
-
-                if await locator.count():
-
-                    await locator.click()
-
-                    await page.wait_for_timeout(
-                        2500
-                    )
-
-                    logger.info(
-                        "WinGo section opened."
-                    )
-
-                    return True
-
-            except Exception:
-                continue
-
-    # Text fallback
+async def get_body_text():
     try:
-
-        locator = page.get_by_text(
-            re.compile(
-                r"win\s*go",
-                re.I
-            )
-        ).first
-
-        if await locator.count():
-
-            await locator.click()
-
-            await page.wait_for_timeout(
-                2500
-            )
-
-            return True
-
+        return await page.locator("body").inner_text(timeout=10000)
     except Exception:
-        pass
-
-    logger.warning(
-        "WinGo section was not found."
-    )
-
-    return False
-
-
-# =========================================================
-# SELECT 1 MINUTE
-# =========================================================
-
-async def select_one_minute():
-
-    patterns = [
-
-        re.compile(
-            r"1\s*minute",
-            re.I
-        ),
-
-        re.compile(
-            r"1\s*min",
-            re.I
-        ),
-
-    ]
-
-    for pattern in patterns:
-
-        for role in [
-            "button",
-            "link"
-        ]:
-
-            try:
-
-                locator = page.get_by_role(
-                    role,
-                    name=pattern
-                ).first
-
-                if await locator.count():
-
-                    await locator.click()
-
-                    await page.wait_for_timeout(
-                        1000
-                    )
-
-                    logger.info(
-                        "1-minute mode selected."
-                    )
-
-                    return True
-
-            except Exception:
-                continue
-
-    logger.warning(
-        "1-minute selector was not found."
-    )
-
-    return False
-
-
-# =========================================================
-# PAGE TEXT
-# =========================================================
-
-async def get_page_text():
-
-    try:
-
-        return await page.locator(
-            "body"
-        ).inner_text(
-            timeout=10000
-        )
-
-    except Exception:
-
         return ""
 
 
-# =========================================================
-# RESULT DETECTOR
-# =========================================================
-
-def extract_result(text):
-
-    # Example:
-    # Result: 7
-    # Winning Number: 3
-
+def extract_period(text):
     patterns = [
-
-        r"(?:result|winning\s*number|winning|number)"
-        r"\s*[:\-]?\s*([0-9])\b",
-
+        r"(?:period|issue|round|draw)\s*[:#-]?\s*([0-9]{5,})",
     ]
 
     for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            re.I
-        )
-
-        if match:
-
-            return match.group(1)
-
-    # Search line by line
-    for line in text.splitlines():
-
-        if re.search(
-            r"result|winning|period",
-            line,
-            re.I
-        ):
-
-            numbers = re.findall(
-                r"\b([0-9])\b",
-                line
-            )
-
-            if numbers:
-
-                return numbers[-1]
+        m = re.search(pattern, text, re.I)
+        if m:
+            return m.group(1)
 
     return None
 
 
-# =========================================================
-# WINNING POPUP DETECTOR
-# =========================================================
-
-def winning_popup_visible(text):
-
-    keywords = [
-
-        r"\bwin\b",
-
-        r"\bwinning\b",
-
-        r"\bcongratulations\b",
-
-        r"you\s+win",
-
-        r"\bwinner\b",
-
+def extract_result(text):
+    # Only read visible text. No betting action is performed.
+    patterns = [
+        r"(?:winning\s*number|result|result\s*number)\s*[:#-]?\s*([0-9])\b",
     ]
 
-    for keyword in keywords:
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            return m.group(1)
 
-        if re.search(
-            keyword,
-            text,
-            re.I
-        ):
+    for line in text.splitlines():
+        if re.search(r"winning|result", line, re.I):
+            nums = re.findall(r"\b([0-9])\b", line)
+            if nums:
+                return nums[-1]
 
-            return True
-
-    return False
+    return None
 
 
-# =========================================================
-# SCREENSHOT
-# =========================================================
+def winning_popup(text):
+    return bool(re.search(
+        r"winning|you\s+win|congratulations|winner",
+        text,
+        re.I
+    ))
 
-async def send_winning_screenshot():
 
-    admin = get_admin_id()
+async def send_current_screen(caption):
+    path = "current_mobile.png"
 
-    if not admin:
-        return
-
-    screenshot_path = (
-        "winning_popup.png"
+    await page.screenshot(
+        path=path,
+        full_page=False
     )
 
-    try:
-
-        await page.screenshot(
-            path=screenshot_path,
-            full_page=False
-        )
-
-        application = (
-            Application
-            .builder()
-            .token(BOT_TOKEN)
-            .build()
-        )
-
-        async with application:
-
-            with open(
-                screenshot_path,
-                "rb"
-            ) as photo:
-
-                await application.bot.send_photo(
-                    chat_id=admin,
-                    photo=photo,
-                    caption=(
-                        "Winning popup screenshot "
-                        "(demo tracker)"
-                    )
-                )
-
-        logger.info(
-            "Winning screenshot sent."
-        )
-
-    except Exception as e:
-
-        logger.error(
-            "Screenshot error: %s",
-            e
-        )
+    await tg_photo(
+        ADMIN_CHAT_ID,
+        path,
+        caption
+    )
 
 
-# =========================================================
-# TRACKER
-# =========================================================
-
-async def tracker_loop():
-
-    global last_result
-    global last_win_signature
+async def tracker():
+    global last_result, last_period, last_popup_signature
 
     try:
+        await login()
+        await open_wingo()
 
-        if not page:
-
-            await login()
-
-        # Open WinGo
-        await find_wingo()
-
-        # Select 1-minute
-        await select_one_minute()
-
-        logger.info(
-            "Tracking started."
+        await tg_send(
+            ADMIN_CHAT_ID,
+            "Demo login successful.\n"
+            "WinGo 1 Minute opened.\n"
+            "Result tracking started."
         )
 
         while True:
+            text = await get_body_text()
 
-            try:
+            period = extract_period(text)
+            result = extract_result(text)
 
-                text = await get_page_text()
+            if period and period != last_period:
+                last_period = period
+                log.info("Period: %s", period)
 
-                # -----------------------------------------
-                # RESULT
-                # -----------------------------------------
+            if result is not None and result != last_result:
+                last_result = result
 
-                result = extract_result(
-                    text
+                msg = f"WinGo 1M result detected: {result}"
+                if period:
+                    msg += f"\nPeriod: {period}"
+
+                await tg_send(
+                    ADMIN_CHAT_ID,
+                    msg
                 )
 
-                if (
-                    result is not None
-                    and result != last_result
-                ):
+            if winning_popup(text):
+                signature = re.sub(
+                    r"\s+",
+                    " ",
+                    text
+                )[-700:]
 
-                    last_result = result
+                if signature != last_popup_signature:
+                    last_popup_signature = signature
 
-                    logger.info(
-                        "Detected result: %s",
-                        result
+                    await asyncio.sleep(
+                        SCREENSHOT_DELAY
                     )
 
-                    await send_admin_text(
-                        "WinGo 1-minute result detected: "
-                        f"{result}"
+                    await send_current_screen(
+                        "Winning/result popup screenshot "
+                        "(demo tracker, mobile layout)"
                     )
 
-                # -----------------------------------------
-                # WINNING POPUP
-                # -----------------------------------------
-
-                if winning_popup_visible(
-                    text
-                ):
-
-                    signature = re.sub(
-                        r"\s+",
-                        " ",
-                        text
-                    )[-500:]
-
-                    if (
-                        signature
-                        != last_win_signature
-                    ):
-
-                        last_win_signature = (
-                            signature
-                        )
-
-                        logger.info(
-                            "Winning popup detected. "
-                            "Waiting %s seconds.",
-                            WIN_SCREENSHOT_DELAY
-                        )
-
-                        await asyncio.sleep(
-                            WIN_SCREENSHOT_DELAY
-                        )
-
-                        await send_winning_screenshot()
-
-                await asyncio.sleep(
-                    POLL_SECONDS
-                )
-
-            except asyncio.CancelledError:
-
-                raise
-
-            except Exception as e:
-
-                logger.exception(
-                    "Tracker loop error: %s",
-                    e
-                )
-
-                await asyncio.sleep(
-                    3
-                )
+            await asyncio.sleep(POLL_SECONDS)
 
     except asyncio.CancelledError:
+        log.info("Tracker stopped.")
+    except Exception as exc:
+        log.exception("Tracker failed")
+        try:
+            await tg_send(
+                ADMIN_CHAT_ID,
+                f"Tracker error:\n{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
+    finally:
+        await close_browser()
 
-        logger.info(
-            "Tracker task stopped."
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "Tracker failed: %s",
-            e
-        )
-
-
-# =========================================================
-# START TRACKER
-# =========================================================
 
 async def start_tracker():
-
     global tracker_task
 
-    if (
-        tracker_task
-        and not tracker_task.done()
-    ):
-
+    if tracker_task and not tracker_task.done():
         return False
 
-    tracker_task = asyncio.create_task(
-        tracker_loop()
-    )
-
+    tracker_task = asyncio.create_task(tracker())
     return True
 
 
-# =========================================================
-# /START
-# =========================================================
-
-async def cmd_start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_admin(update):
-        return
-
-    await update.message.reply_text(
-        "YaarWin Demo Tracker\n\n"
-        "/setlogin NUMBER PASSWORD\n"
-        "/run\n"
-        "/stop\n"
-        "/status\n"
-        "/screenshot\n\n"
-        "Tracker only reads the demo page "
-        "and sends result/screenshot updates."
-    )
-
-
-# =========================================================
-# /SETLOGIN
-# =========================================================
-
-async def cmd_setlogin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    global login_phone
-    global login_password
-
-    if not is_admin(update):
-        return
-
-    if len(context.args) != 2:
-
-        await update.message.reply_text(
-            "Format:\n"
-            "/setlogin DEMO_NUMBER DEMO_PASSWORD"
-        )
-
-        return
-
-    login_phone = context.args[0]
-
-    login_password = context.args[1]
-
-    await update.message.reply_text(
-        "Demo login saved for this running bot.\n\n"
-        "Now use /run"
-    )
-
-
-# =========================================================
-# /RUN
-# =========================================================
-
-async def cmd_run(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_admin(update):
-        return
-
-    started = await start_tracker()
-
-    if started:
-
-        await update.message.reply_text(
-            "Demo tracker started.\n\n"
-            "Login → WinGo 1 Minute → "
-            "result tracking → "
-            "winning screenshot."
-        )
-
-    else:
-
-        await update.message.reply_text(
-            "Tracker is already running."
-        )
-
-
-# =========================================================
-# /STOP
-# =========================================================
-
-async def cmd_stop(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def stop_tracker():
     global tracker_task
 
-    if not is_admin(update):
-        return
-
-    if tracker_task:
-
+    if tracker_task and not tracker_task.done():
         tracker_task.cancel()
 
-        tracker_task = None
+        try:
+            await tracker_task
+        except asyncio.CancelledError:
+            pass
 
-        await update.message.reply_text(
+    tracker_task = None
+    await close_browser()
+
+
+async def handle_command(chat_id, text):
+    global login_phone, login_password
+
+    if not admin_ok(chat_id):
+        return
+
+    parts = text.strip().split()
+
+    if not parts:
+        return
+
+    command = parts[0].split("@")[0].lower()
+
+    if command == "/start":
+        await tg_send(
+            chat_id,
+            "YaarWin Demo Tracker\n\n"
+            "/setlogin NUMBER PASSWORD\n"
+            "/run\n"
+            "/stop\n"
+            "/status\n"
+            "/screenshot\n\n"
+            "This version only logs in, opens WinGo 1M, "
+            "reads visible results and sends screenshots."
+        )
+
+    elif command == "/setlogin":
+        if len(parts) != 3:
+            await tg_send(
+                chat_id,
+                "Use:\n/setlogin DEMO_NUMBER DEMO_PASSWORD"
+            )
+            return
+
+        login_phone = parts[1]
+        login_password = parts[2]
+
+        await tg_send(
+            chat_id,
+            "Demo login saved in memory.\n"
+            "Now use /run"
+        )
+
+    elif command == "/run":
+        started = await start_tracker()
+
+        if started:
+            await tg_send(
+                chat_id,
+                "Tracker started."
+            )
+        else:
+            await tg_send(
+                chat_id,
+                "Tracker is already running."
+            )
+
+    elif command == "/stop":
+        await stop_tracker()
+        await tg_send(
+            chat_id,
             "Tracker stopped."
         )
 
-    else:
-
-        await update.message.reply_text(
-            "Tracker is not running."
+    elif command == "/status":
+        running = bool(
+            tracker_task
+            and not tracker_task.done()
         )
 
-
-# =========================================================
-# /STATUS
-# =========================================================
-
-async def cmd_status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_admin(update):
-        return
-
-    running = bool(
-        tracker_task
-        and not tracker_task.done()
-    )
-
-    await update.message.reply_text(
-        "Tracker Status\n\n"
-        f"Running: {running}\n"
-        f"Last result: {last_result}\n"
-        f"Screenshot delay: "
-        f"{WIN_SCREENSHOT_DELAY}s\n"
-        f"Poll interval: "
-        f"{POLL_SECONDS}s"
-    )
-
-
-# =========================================================
-# /SCREENSHOT
-# =========================================================
-
-async def cmd_screenshot(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_admin(update):
-        return
-
-    if not page:
-
-        await update.message.reply_text(
-            "Browser is not running.\n"
-            "Use /run first."
+        await tg_send(
+            chat_id,
+            f"Running: {running}\n"
+            f"Last period: {last_period}\n"
+            f"Last result: {last_result}"
         )
 
-        return
+    elif command == "/screenshot":
+        if not page:
+            await tg_send(
+                chat_id,
+                "Browser is not running. Use /run first."
+            )
+            return
 
-    path = "manual_screenshot.png"
-
-    try:
-
-        await page.screenshot(
-            path=path,
-            full_page=False
-        )
-
-        with open(
-            path,
-            "rb"
-        ) as photo:
-
-            await update.message.reply_photo(
-                photo=photo,
-                caption=(
-                    "Current demo tracker screen"
-                )
+        try:
+            await send_current_screen(
+                "Current WinGo mobile screen"
+            )
+        except Exception as exc:
+            await tg_send(
+                chat_id,
+                f"Screenshot error: {exc}"
             )
 
-    except Exception as e:
 
-        await update.message.reply_text(
-            f"Screenshot error: {e}"
-        )
+async def telegram_polling():
+    offset = None
+
+    await tg_send(
+        ADMIN_CHAT_ID,
+        "Demo tracker bot is online."
+    )
+
+    while True:
+        try:
+            params = {
+                "timeout": 25,
+                "allowed_updates": json.dumps(["message"])
+            }
+
+            if offset is not None:
+                params["offset"] = offset
+
+            result = await tg_call(
+                "getUpdates",
+                params
+            )
+
+            for update in result.get("result", []):
+                offset = update["update_id"] + 1
+
+                message = update.get("message") or {}
+                chat = message.get("chat") or {}
+                chat_id = chat.get("id")
+
+                text = message.get("text", "")
+
+                if chat_id and text:
+                    await handle_command(
+                        chat_id,
+                        text
+                    )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
+            log.exception(
+                "Telegram polling error: %s",
+                exc
+            )
+            await asyncio.sleep(3)
 
 
-# =========================================================
-# TELEGRAM POST INIT
-# =========================================================
-
-async def post_init(
-    application: Application
-):
-
-    # Don't auto-start if no login credentials exist.
-    # Set them with /setlogin and then use /run.
-    if login_phone and login_password:
-
-        logger.info(
-            "Login credentials found. "
-            "Use /run to start tracker."
-        )
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
+async def main():
     if not BOT_TOKEN:
-
-        raise SystemExit(
-            "BOT_TOKEN is missing."
-        )
+        raise SystemExit("BOT_TOKEN is missing.")
 
     if not ADMIN_CHAT_ID:
+        raise SystemExit("ADMIN_CHAT_ID is missing.")
 
-        raise SystemExit(
-            "ADMIN_CHAT_ID is missing."
-        )
+    await telegram_polling()
 
-    application = (
-        Application
-        .builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            cmd_start
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "setlogin",
-            cmd_setlogin
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "run",
-            cmd_run
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "stop",
-            cmd_stop
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "status",
-            cmd_status
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "screenshot",
-            cmd_screenshot
-        )
-    )
-
-    logger.info(
-        "Telegram bot starting..."
-    )
-
-    application.run_polling(
-        close_loop=False
-    )
-
-
-# =========================================================
-# ENTRY
-# =========================================================
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
